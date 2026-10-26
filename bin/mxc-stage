@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+# "Install" .debs without root: unpack them into .mxc/stage and generate a
+# bin/dosemu launcher that uses the staged binary, plugins, libs and data.
+# Needs no root; run it on the host (the sandbox only sees its workspace). Use the result with
+#   bin/mxc-run --stage -- dosemu ...
+#
+# Usage:
+#   bin/mxc-stage DEB...         unpack these debs on top of the current stage
+#   bin/mxc-stage --clean DEB... start from an empty stage
+#   bin/mxc-stage --clean        just empty the stage
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+STAGE="$ROOT_DIR/.mxc/stage"
+
+if [ "${1:-}" = "--clean" ]; then
+    rm -rf "$STAGE"
+    shift
+fi
+mkdir -p "$STAGE"
+
+for deb in "$@"; do
+    case "$deb" in
+        *-dbgsym_*|*.ddeb) continue ;;
+    esac
+    echo "--- unpacking $(basename "$deb")"
+    dpkg-deb -x "$deb" "$STAGE"
+done
+
+if [ -f "$STAGE/usr/bin/dosemu" ]; then
+    mkdir -p "$STAGE/bin"
+    # The stock launcher hardcodes /usr/libexec and the system data dirs; point
+    # them at the stage. OPTS is unset in the stock script, so it can be seeded.
+    sed -e "s|^libexecdir=.*|libexecdir=$STAGE/usr/libexec\n\
+export LD_LIBRARY_PATH=$STAGE/usr/lib/x86_64-linux-gnu:$STAGE/usr/lib/dosemu\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\n\
+OPTS=\"--Flibdir $STAGE/usr/share/dosemu --Fcmddir $STAGE/usr/share/dosemu/commands --Fplugindir $STAGE/usr/lib/dosemu\"|" \
+        "$STAGE/usr/bin/dosemu" > "$STAGE/bin/dosemu"
+    chmod +x "$STAGE/bin/dosemu"
+    echo "staged launcher: $STAGE/bin/dosemu"
+fi

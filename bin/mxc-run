@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Run a command in an MXC (bubblewrap) sandbox for dosemu2.
+
+    mxc-run [options] -- COMMAND [ARGS...]
+
+The workspace (default: the current directory) is the only writable project
+dir; the host's /usr, /etc, ... come in read-only through MXC's
+deny-by-default baseline, so dosemu2 must be installed on the host.
+See README.md.
+"""
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+EXEC = os.path.join(ROOT, ".mxc", "lxc-exec")
+
+
+def main():
+    default_ws = os.environ.get("MXC_WORKSPACE", os.getcwd())
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--workspace", default=default_ws,
+                    help="writable project dir and cwd (default: %(default)s)")
+    ap.add_argument("--cwd", metavar="DIR",
+                    help="directory to run in, inside the workspace (default: the workspace)")
+    ap.add_argument("--net", choices=["deny", "allow"], default="deny",
+                    help="network egress; 'allow' needs unprivileged netns (see README)")
+    ap.add_argument("--stage", action="store_true",
+                    help="put .mxc/stage (see bin/mxc-stage) first on PATH")
+    ap.add_argument("--no-x11", action="store_true", help="do not forward X11")
+    ap.add_argument("--ro", action="append", default=[], metavar="PATH",
+                    help="extra read-only path (repeatable)")
+    ap.add_argument("--rw", action="append", default=[], metavar="PATH",
+                    help="extra read-write path (repeatable)")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V")
+    ap.add_argument("--print-config", action="store_true",
+                    help="print the MXC JSON request and exit")
+    ap.add_argument("--debug", action="store_true", help="pass --debug to lxc-exec")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        ap.error("no command given (put it after --)")
+
+    ws = os.path.realpath(a.workspace)
+    cwd = os.path.realpath(a.cwd) if a.cwd else ws
+    if os.path.commonpath([ws, cwd]) != ws:
+        ap.error("--cwd must be inside the workspace")
+    home = os.path.join(ROOT, ".mxc", "home")  # persists dosemu/dedb state
+    os.makedirs(home, exist_ok=True)
+
+    # Workspace bin/ first, then the standard PATH (/usr/local is mounted below).
+    path = ":".join([os.path.join(ws, "bin"),
+                     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"])
+    stage = os.path.join(ROOT, ".mxc", "stage")
+    if a.stage:
+        if not os.path.isdir(os.path.join(stage, "bin")):
+            ap.error("nothing staged: run bin/mxc-stage DEB... first")
+        path = os.path.join(stage, "bin") + ":" + path
+    env = [f"HOME={home}", f"PATH={path}", "TERM=" + os.environ.get("TERM", "xterm-256color"),
+           f"MXC_SANDBOX=1"]
+
+    # /usr/include: headers for compiling. /var/lib/dpkg: dpkg-buildpackage / dpkg-shlibdeps read the package database.
+    ro = ["/usr/local", "/usr/include", "/var/lib/dpkg"] + a.ro
+    if a.stage:
+        ro.append(stage)
+    rw = [ws, home] + a.rw
+
+    if not a.no_x11 and os.environ.get("DISPLAY"):
+        env.append("DISPLAY=" + os.environ["DISPLAY"])
+        rw.append("/tmp/.X11-unix")
+        xauth = os.environ.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
+        if os.path.exists(xauth):
+            env.append("XAUTHORITY=" + xauth)
+            ro.append(xauth)
+
+    req = {
+        "version": "1.0.0",
+        "containment": "bubblewrap",
+        "process": {
+            "commandLine": shlex.join(cmd),
+            "cwd": cwd,
+            "env": env + a.env,
+        },
+        "filesystem": {
+            "readonlyPaths": [p for p in ro if os.path.exists(p)],
+            "readwritePaths": rw,
+        },
+        "network": {"egress": {"default": a.net}},
+    }
+
+    if a.print_config:
+        print(json.dumps(req, indent=2))
+        return 0
+    if not os.access(EXEC, os.X_OK):
+        sys.exit("lxc-exec missing: run bin/mxc-fetch.sh first")
+    argv = [EXEC] + (["--debug"] if a.debug else [])
+    os.execv(EXEC, argv + ["--config-base64", __import__("base64").b64encode(
+        json.dumps(req).encode()).decode()])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

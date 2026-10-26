@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euo pipefail
+
+# Build the .deb(s) for a Debian-packaged source tree inside the sandbox.
+# dpkg-buildpackage drops its output in the source dir's parent, so that parent
+# is the writable workspace; nothing else on the host is writable.
+#
+# The build dependencies must already be installed on the host
+# (dpkg-checkbuilddeps tells you what is missing).
+#
+# Usage: bin/mxc-deb SRCDIR [dpkg-buildpackage args...]
+#   bin/mxc-deb ~/src/dosemu2
+#   bin/mxc-deb ~/src/fdpp -j4
+
+BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+src=$(realpath "${1:?usage: mxc-deb SRCDIR [dpkg-buildpackage args...]}")
+shift
+[ -d "$src/debian" ] || { echo "!! $src has no debian/ directory" >&2; exit 1; }
+
+# Binary-only, unsigned, and `-tc` cleans the tree afterwards.
+args=("$@")
+[ "${#args[@]}" -gt 0 ] || args=("-j$(nproc)")
+
+# A submodule's .git is a file pointing at a gitdir elsewhere; debian/rules runs
+# `git describe` for the version, so expose that gitdir read-only.
+ro=()
+if [ -f "$src/.git" ]; then
+    gitdir=$(sed -n 's/^gitdir: //p' "$src/.git")
+    ro=(--ro "$(realpath "$src/$gitdir")")
+fi
+
+exec "$BIN_DIR/mxc-run" --workspace "$(dirname "$src")" --cwd "$src" "${ro[@]}" -- \
+    dpkg-buildpackage -b -us -uc -tc "${args[@]}"
